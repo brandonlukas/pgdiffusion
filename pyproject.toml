@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pgdiffusion"
+version = "0.1.0"
+description = "Pseudotime Graph Diffusion: random-walk feature diffusion on pseudotime graphs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Brandon Lukas"}
+]
+keywords = ["single-cell", "biology", "pseudotime", "graph", "diffusion"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+
+dependencies = [
+    "torch>=1.10.0",
+    "numpy>=1.20.0",
+    "anndata>=0.8.0",
+    "scanpy>=1.9.0",
+    "matplotlib>=3.3.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+docs = [
+    "sphinx>=4.0",
+    "sphinx-rtd-theme>=1.0",
+    "sphinx-autodoc-typehints>=1.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/brandonlukas/pgdiffusion"
+Documentation = "https://github.com/brandonlukas/pgdiffusion"
+Repository = "https://github.com/brandonlukas/pgdiffusion.git"
+
+[tool.setuptools]
+# Package is published and imported as `pgdiffusion`
+packages = ["pgdiffusion"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
