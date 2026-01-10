@@ -109,6 +109,7 @@ Constructs a sparse pseudotime graph from branched cell trajectories.
 - `edge_index` (np.ndarray): Shape (2, E) sparse edges
 - `edge_attr` (np.ndarray, optional): Shape (E,) positional steps
 
+
 ### `diffuse()`
 
 Applies random-walk feature diffusion on the graph.
@@ -120,9 +121,15 @@ Applies random-walk feature diffusion on the graph.
 - `n_steps` (int): Number of iterations (default: 1)
 - `add_self_loops` (bool): Add residual self-loops (default: True)
 - `edge_weight` (torch.Tensor | None): Optional per-edge weights for weighted aggregation (default: None)
+- `M` (torch.Tensor | None): Optional explicit feature-mixing matrix (n_features, n_features). Use for small feature spaces (e.g., PCA). Mutually exclusive with `U`.
+- `U` (torch.Tensor | None): Optional low-rank feature coupling (n_features, r). Use for large feature spaces (e.g., genes). Mutually exclusive with `M`.
+- `beta` (float): Coupling strength for low-rank U. Ignored if U is None. Default: 0.0.
 
 **Returns**:
 - `X_diffused` (torch.Tensor): Smoothed features, same shape as X
+
+**Notes**:
+- Only one of `M` or `U` may be provided. If both are given, a `ValueError` is raised.
 
 ## Example: Alpha Effect on Embeddings
 

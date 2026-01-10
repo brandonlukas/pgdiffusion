@@ -17,52 +17,60 @@ def diffuse(
     n_steps: int = 1,
     add_self_loops: bool = True,
     edge_weight: torch.Tensor | None = None,
+    M: torch.Tensor | None = None,
+    U: torch.Tensor | None = None,
+    beta: float = 0.0,
 ):
-    """Random-walk feature diffusion on pseudotime graph.
+    """
+    Random-walk feature diffusion on a pseudotime graph.
 
-    Smooths feature values across neighboring cells in the pseudotime graph using
-    iterative aggregation. At each step, each cell's features are updated as a
-    weighted blend of its own features and the mean features of its neighbors.
+    At each step, features are updated as a blend of their own value and the mean
+    of their neighbors, with optional feature-to-feature mixing:
 
-    **Mathematical operation**: At iteration :math:`t`,
-    :math:`X^{(t+1)}_i = (1 - \\alpha) X^{(t)}_i + \\alpha \\cdot \\text{mean}_{j \\in N(i)} X^{(t)}_j`
+    Explicit (square matrix):
+        X^{(t+1)} = (1 - alpha) X^{(t)} + alpha * P X^{(t)} M
+    Low-rank (efficient for large d):
+        X^{(t+1)} = (1 - alpha) X^{(t)} + alpha * P X^{(t)} (I + beta U U^T)
 
-    where :math:`N(i)` is the set of neighbors of node :math:`i` in the graph.
-    Higher :math:`\\alpha` increases smoothing; :math:`\\alpha = 0` returns unchanged features,
-    :math:`\\alpha = 1` returns pure neighbor aggregation.
-
-    Uses in-place PyTorch scatter operations (``index_add_``) for GPU efficiency.
-    Degree clamping prevents division by zero for isolated nodes.
+    where:
+      - P is the propagation operator (neighbor mean)
+      - M is an explicit (d, d) feature-mixing matrix (for small d)
+      - U is a (d, r) low-rank feature coupling (for large d)
+      - beta is the low-rank coupling strength
+      - Only one of M or U may be provided
 
     Parameters
     ----------
-    X
-        Feature matrix of shape (n_cells, n_features) with dtype float32 or float64.
-        Typically embeddings (e.g., PCA coordinates).
-    edge_index
-        Sparse graph edges of shape (2, n_edges) with dtype int64.
-        Row 0: source indices, Row 1: destination indices.
-    alpha
-        Blending weight for neighbor features, in [0, 1]. Default: 0.6.
-        - 0.0 = no diffusion (identity, returns original X)
-        - 0.6 = balanced blend (recommended)
-        - 1.0 = full neighbor averaging
-    n_steps
-        Number of diffusion iterations. Default: 1.
-        More steps = more smoothing (cumulative effect).
-    add_self_loops
-        If True, add self-loops to graph before diffusion (residual connection).
-        Default: True.
-    edge_weight
-        Optional per-edge weights of shape (n_edges,). If provided, performs a
-        weighted neighbor aggregation where each incoming edge contributes
-        proportionally to its weight. When `add_self_loops=True`, unit-weight
-        self-loops are appended. If `None`, all edges are treated as weight=1.
+    X : torch.Tensor
+        Feature matrix (n_cells, n_features)
+    edge_index : torch.Tensor
+        Sparse edges (2, n_edges)
+    alpha : float
+        Blending weight in (0, 1] (default: 0.6)
+    n_steps : int
+        Number of diffusion iterations (default: 1)
+    add_self_loops : bool
+        Add residual self-loops (default: True)
+    edge_weight : torch.Tensor | None
+        Optional per-edge weights for weighted aggregation (default: None)
+    M : torch.Tensor | None
+        Optional explicit feature-mixing matrix (n_features, n_features).
+        Use for small feature spaces (e.g., PCA).
+    U : torch.Tensor | None
+        Optional low-rank feature coupling (n_features, r).
+        Use for large feature spaces (e.g., genes).
+    beta : float
+        Coupling strength for low-rank U. Ignored if U is None. Default: 0.0.
 
     Returns
     -------
-    X_diffused
-        Diffused feature matrix, same shape and dtype as input X.
+    X_diffused : torch.Tensor
+        Smoothed features, same shape as X
+
+    Raises
+    ------
+    ValueError
+        If both M and U are provided, or if their shapes are invalid.
 
     Examples
     --------
@@ -74,8 +82,8 @@ def diffuse(
     >>> X = torch.tensor(adata.obsm["X_pca"], dtype=torch.float32)
     >>> edge_index = pgd.build_graph(adata, trajectories)
     >>> edge_index = torch.tensor(edge_index, dtype=torch.long)
-    >>> X_smooth = pgd.diffuse(X, edge_index, alpha=0.6, n_steps=1)
-    >>> adata.obsm["X_pseudotime"] = X_smooth.cpu().numpy()
+    >>> X_diffused = pgd.diffuse(X, edge_index, alpha=0.6, n_steps=1)
+    >>> adata.obsm["X_pseudotime"] = X_diffused.cpu().numpy()
 
     Weighted edges example
     ----------------------
@@ -93,8 +101,8 @@ def diffuse(
     ...     adata, trajectories, include_step_attr=True
     ... )
     >>> edge_index = torch.tensor(edge_index, dtype=torch.long)
-    >>> edge_weight = torch.tensor(1.0 / (edge_steps + 1.0), dtype=X.dtype)
-    >>> X_smooth = pgd.diffuse(
+    >>> edge_weight = torch.tensor(1.0 / (edge_steps + 1.0), dtype=torch.float32)
+    >>> X_diffused = pgd.diffuse(
     ...     X,
     ...     edge_index,
     ...     alpha=0.6,
@@ -102,7 +110,7 @@ def diffuse(
     ...     add_self_loops=True,
     ...     edge_weight=edge_weight,
     ... )
-    >>> adata.obsm["X_pseudotime"] = X_smooth.cpu().numpy()
+    >>> adata.obsm["X_pseudotime"] = X_diffused.cpu().numpy()
     """
     N, d = X.shape
 
@@ -112,6 +120,19 @@ def diffuse(
         raise ValueError(f"alpha must be in [0, 1], got {alpha}")
     if not isinstance(n_steps, int) or n_steps < 1:
         raise ValueError(f"n_steps must be a positive integer, got {n_steps}")
+    if M is not None and U is not None:
+        raise ValueError("Provide either M (explicit) or U (low-rank), not both.")
+    if M is not None:
+        if M.dim() != 2 or M.shape[0] != d or M.shape[1] != d:
+            raise ValueError(
+                f"M must have shape (n_features, n_features) = ({d}, {d}), "
+                f"got {tuple(M.shape)}"
+            )
+    elif U is not None:
+        if U.dim() != 2 or U.shape[0] != d:
+            raise ValueError(f"U must have shape (d, r)=({d}, r), got {tuple(U.shape)}")
+        if beta < 0:
+            raise ValueError("beta must be >= 0")
 
     src, dst = edge_index
 
@@ -137,6 +158,12 @@ def diffuse(
     deg.index_add_(0, dst, w)
     deg = deg.clamp_min(1.0)
 
+    # Move M/U to correct device/dtype if provided
+    if M is not None:
+        M = M.to(device=X.device, dtype=X.dtype)
+    elif U is not None:
+        U = U.to(device=X.device, dtype=X.dtype)
+
     H = X
     with Progress(
         SpinnerColumn(),
@@ -151,6 +178,13 @@ def diffuse(
             agg = torch.zeros_like(H)
             agg.index_add_(0, dst, H[src] * w.unsqueeze(-1))
             agg = agg / deg.unsqueeze(-1)
+            # Feature coupling
+            if M is not None:
+                agg = agg @ M
+            elif U is not None and beta != 0.0:
+                # agg @ (I + beta U U^T) = agg + beta (agg U) U^T
+                agg = agg + beta * ((agg @ U) @ U.T)
+
             H = (1 - alpha) * H + alpha * agg
             progress.advance(task_id)
 
