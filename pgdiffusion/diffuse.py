@@ -1,3 +1,4 @@
+import math
 import torch
 from rich.progress import (
     Progress,
@@ -15,8 +16,9 @@ def diffuse(
     *,
     alpha: float = 0.6,
     n_steps: int = 1,
-    add_self_loops: bool = True,
     edge_weight: torch.Tensor | None = None,
+    add_self_loops: bool = False,
+    self_loop_weight: float = 1.0,
     M: torch.Tensor | None = None,
     U: torch.Tensor | None = None,
     beta: float = 0.0,
@@ -24,53 +26,55 @@ def diffuse(
     """
     Random-walk feature diffusion on a pseudotime graph.
 
-    At each step, features are updated as a blend of their own value and the mean
-    of their neighbors, with optional feature-to-feature mixing:
+    We update features by blending a residual term with an incoming-neighbor
+    (src -> dst) weighted mean aggregation, followed by optional feature coupling.
 
-    Explicit (square matrix):
-        X^{(t+1)} = (1 - alpha) X^{(t)} + alpha * P X^{(t)} M
-    Low-rank (efficient for large d):
-        X^{(t+1)} = (1 - alpha) X^{(t)} + alpha * P X^{(t)} (I + beta U U^T)
+    **Mathematical formulation**: In the simplest case (unweighted graph, no feature
+    coupling), let H^(t) in R^(N x d) denote the feature matrix at iteration t. One
+    diffusion step is given by
 
-    where:
-      - P is the propagation operator (neighbor mean)
-      - M is an explicit (d, d) feature-mixing matrix (for small d)
-      - U is a (d, r) low-rank feature coupling (for large d)
-      - beta is the low-rank coupling strength
-      - Only one of M or U may be provided
+        H^(t+1) = (1 - alpha) H^(t) + alpha * P H^(t),
+
+    where the propagation operator P is defined as
+
+        P = D^(-1) A.
+
+    Here A is the adjacency matrix with entries A[i, s] = 1 if there is an edge
+    s -> i and 0 otherwise, and D is the diagonal in-degree matrix with
+    D[i, i] = sum_s A[i, s].
 
     Parameters
     ----------
     X : torch.Tensor
         Feature matrix (n_cells, n_features)
     edge_index : torch.Tensor
-        Sparse edges (2, n_edges)
+        Sparse edges (2, n_edges), with (src, dst)
     alpha : float
-        Blending weight in (0, 1] (default: 0.6)
+        Blend weight in [0, 1]
     n_steps : int
-        Number of diffusion iterations (default: 1)
-    add_self_loops : bool
-        Add residual self-loops (default: True)
+        Number of diffusion iterations
     edge_weight : torch.Tensor | None
-        Optional per-edge weights for weighted aggregation (default: None)
+        Optional per-edge weights aligned with edge_index columns (n_edges,)
+    add_self_loops : bool
+        If True, include self-loops in the aggregation operator (default: False)
+    self_loop_weight : float
+        Weight assigned to self-loop edges when add_self_loops=True (default: 1.0)
     M : torch.Tensor | None
-        Optional explicit feature-mixing matrix (n_features, n_features).
-        Use for small feature spaces (e.g., PCA).
+        Optional explicit feature mixing matrix (d, d)
     U : torch.Tensor | None
-        Optional low-rank feature coupling (n_features, r).
-        Use for large feature spaces (e.g., genes).
+        Optional low-rank feature coupling (d, r) (e.g., PCA loadings)
     beta : float
-        Coupling strength for low-rank U. Ignored if U is None. Default: 0.0.
+        Coupling strength for low-rank U; ignored if U is None
 
     Returns
     -------
-    X_diffused : torch.Tensor
-        Smoothed features, same shape as X
+    torch.Tensor
+        Smoothed features with the same shape as ``X``.
 
     Raises
     ------
     ValueError
-        If both M and U are provided, or if their shapes are invalid.
+        If both ``M`` and ``U`` are provided, or if shapes are invalid.
 
     Examples
     --------
@@ -82,42 +86,50 @@ def diffuse(
     >>> X = torch.tensor(adata.obsm["X_pca"], dtype=torch.float32)
     >>> edge_index = pgd.build_graph(adata, trajectories)
     >>> edge_index = torch.tensor(edge_index, dtype=torch.long)
-    >>> X_diffused = pgd.diffuse(X, edge_index, alpha=0.6, n_steps=1)
-    >>> adata.obsm["X_pseudotime"] = X_diffused.cpu().numpy()
+    >>> X_smooth = pgd.diffuse(X, edge_index, alpha=0.6, n_steps=1)
+    >>> adata.obsm["X_pseudotime"] = X_smooth.cpu().numpy()
 
     Weighted edges example
     ----------------------
     Use positional steps from `build_graph(..., include_step_attr=True)` to derive
     per-edge weights (e.g., inverse-distance) and pass them via `edge_weight`.
 
-    >>> import torch
-    >>> import numpy as np
-    >>> import scanpy as sc
-    >>> import pgdiffusion as pgd
-    >>> adata = sc.read_h5ad("data.h5ad")
-    >>> trajectories = {"branch": ["cell_0", "cell_1", "cell_2"]}
-    >>> X = torch.tensor(adata.obsm["X_pca"], dtype=torch.float32)
     >>> edge_index, edge_steps = pgd.build_graph(
     ...     adata, trajectories, include_step_attr=True
     ... )
     >>> edge_index = torch.tensor(edge_index, dtype=torch.long)
     >>> edge_weight = torch.tensor(1.0 / (edge_steps + 1.0), dtype=torch.float32)
-    >>> X_diffused = pgd.diffuse(
+    >>> X_smooth = pgd.diffuse(
     ...     X,
     ...     edge_index,
     ...     alpha=0.6,
     ...     n_steps=1,
-    ...     add_self_loops=True,
     ...     edge_weight=edge_weight,
     ... )
-    >>> adata.obsm["X_pseudotime"] = X_diffused.cpu().numpy()
+
+    Feature coupling (PCA loadings) example
+    ---------------------------------------
+    Apply low-rank feature coupling using PCA loadings U (e.g., Scanpy stores gene
+    loadings in ``adata.varm["PCs"]``). This biases diffusion toward the principal
+    subspace while preserving full feature dimensionality.
+
+    >>> X = torch.tensor(adata.X.toarray(), dtype=torch.float32)  # (n_cells, n_genes)
+    >>> U = torch.tensor(adata.varm["PCs"], dtype=torch.float32)  # (n_genes, n_pcs)
+    >>> X_smooth = pgd.diffuse(X, edge_index, alpha=0.5, n_steps=5, U=U, beta=0.3)
     """
     N, d = X.shape
 
     if edge_index.shape[0] != 2:
         raise ValueError(f"edge_index must have shape (2, E), got {edge_index.shape}")
+    if edge_index.min() < 0 or edge_index.max() >= N:
+        raise ValueError(f"edge_index contains node ids outside [0, {N-1}]")
     if not 0.0 <= alpha <= 1.0:
         raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+    if add_self_loops:
+        if not math.isfinite(self_loop_weight):
+            raise ValueError("self_loop_weight must be finite")
+        if self_loop_weight < 0:
+            raise ValueError("self_loop_weight must be >= 0")
     if not isinstance(n_steps, int) or n_steps < 1:
         raise ValueError(f"n_steps must be a positive integer, got {n_steps}")
     if M is not None and U is not None:
@@ -134,6 +146,7 @@ def diffuse(
         if beta < 0:
             raise ValueError("beta must be >= 0")
 
+    edge_index = edge_index.to(device=X.device)
     src, dst = edge_index
 
     # Prepare edge weights (default to ones)
@@ -143,17 +156,32 @@ def diffuse(
                 f"edge_weight must be 1D with length equal to number of edges ({src.shape[0]}), "
                 f"got shape {tuple(edge_weight.shape)}"
             )
+        if not torch.isfinite(edge_weight).all():
+            raise ValueError("edge_weight must contain only finite values")
+        if (edge_weight < 0).any():
+            raise ValueError("edge_weight must be >= 0")
         w = edge_weight.to(device=X.device, dtype=X.dtype)
     else:
         w = torch.ones(src.shape[0], device=X.device, dtype=X.dtype)
 
+    # (optional) include self-loops inside the aggregation operator
     if add_self_loops:
         self_edges = torch.arange(N, device=X.device)
         src = torch.cat([src, self_edges])
         dst = torch.cat([dst, self_edges])
-        w = torch.cat([w, torch.ones(N, device=X.device, dtype=X.dtype)])
+        w = torch.cat(
+            [
+                w,
+                torch.full(
+                    (N,),
+                    float(self_loop_weight),
+                    device=X.device,
+                    dtype=X.dtype,
+                ),
+            ]
+        )
 
-    # Precompute in-degree for mean aggregation
+    # Precompute weighted in-degree for mean aggregation into dst
     deg = torch.zeros(N, device=X.device, dtype=X.dtype)
     deg.index_add_(0, dst, w)
     deg = deg.clamp_min(1.0)
@@ -198,6 +226,6 @@ if __name__ == "__main__":
         [[0, 1, 2, 3, 0, 1], [1, 2, 3, 0, 2, 3]],
         dtype=torch.long,
     )
-    X_diffused = diffuse(X, edge_index, alpha=0.5, n_steps=1)
+    X_smooth = diffuse(X, edge_index, alpha=0.5, n_steps=1)
     print("Original X:\n", X)
-    print("Diffused X:\n", X_diffused)
+    print("Smoothed X:\n", X_smooth)

@@ -4,7 +4,7 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**PGD** is a lightweight library for random-walk feature diffusion on pseudotime graphs. It smooths single-cell embeddings along cell trajectories, denoising features in a trajectory-aware way.
+**PGD** is a lightweight library for random-walk feature diffusion on pseudotime graphs. It smooths single-cell embeddings and features along cell trajectories, enhancing pseudotime structure and denoising features in a trajectory-aware way.
 
 ## Features
 
@@ -44,7 +44,7 @@ trajectories = {
   "mesenchymal": ["cell_2", "cell_4", "cell_5"],
 }
 
-# Get embeddings (PCA, UMAP, etc.)
+# Get embeddings (e.g., PCA)
 X = torch.tensor(adata.obsm["X_pca"], dtype=torch.float32)
 
 # Build pseudotime graph
@@ -71,25 +71,31 @@ Given branched trajectories where each branch defines an ordered cell sequence, 
 
 $$c_i \text{ connects to } c_j \text{ if } |i - j| \leq k$$
 
-Here $k$ is the sliding-window radius (`neighbors_per_side`). Edges are bidirectional, and self-loops are excluded.
+Here $k$ is the sliding-window radius. Edges are bidirectional, and self-loops are excluded.
 
 **Multi-branch handling**: If multiple branches share an edge between the same cell pair, the shortest positional distance is retained.
 
 ### Feature Diffusion
 
-The diffusion operation performs iterative feature smoothing via random-walk aggregation:
+PGD performs iterative feature smoothing via an incoming random-walk operator on the pseudotime graph, combined with a residual connection.
 
-$$X^{(t+1)}_i = (1 - \alpha) X^{(t)}_i + \alpha \cdot \text{mean}_{j \in N(i)} X^{(t)}_j$$
+In the simplest case (unweighted graph, no feature coupling), one diffusion step is
 
-where:
-- $X^{(t)}_i$ is the feature vector of cell $i$ at iteration $t$
-- $N(i)$ is the set of neighbors of node $i$ in the pseudotime graph
-- $\alpha \in (0, 1]$ controls the blending weight
+$$X^{(t+1)} = (1 - \alpha)\, X^{(t)} + \alpha\, P X^{(t)}$$
 
-**Parameter Effects**:
-- $\alpha = 0$: no diffusion (identity)
-- $\alpha = 0.5$: balanced blend of own and neighbor features
-- $\alpha = 1$: pure neighbor aggregation
+where $P = D^{-1} A$ is the incoming random-walk operator, $A$ is the adjacency matrix, and $D$ is the diagonal in-degree matrix.
+
+Equivalently, each cell updates its features by averaging over its incoming neighbors along the pseudotime graph.
+
+#### Extensions
+- **Weighted edges**: adjacency entries are replaced by edge weights and
+  normalized by weighted in-degree.
+- **Feature coupling**: after aggregation, features may be transformed using
+  either:
+  - an explicit mixing matrix $M$, or
+  - a low-rank coupling $I + \beta U U^\top$ (e.g., PCA loadings).
+- **Self-loops**: optional self-edges may be included inside the aggregation
+  operator, in addition to the residual term.
 
 **Computational Efficiency**: Uses in-place PyTorch scatter operations (`index_add_`) and degree clamping for GPU efficiency and numerical stability.
 
@@ -106,34 +112,44 @@ Constructs a sparse pseudotime graph from branched cell trajectories.
 - `include_step_attr` (bool): Return edge positional steps (default: False)
 
 **Returns**:
-- `edge_index` (np.ndarray): Shape (2, E) sparse edges
-- `edge_attr` (np.ndarray, optional): Shape (E,) positional steps
+- `edge_index` (np.ndarray): Shape (2, n_edges) sparse edges
+- `edge_attr` (np.ndarray, optional): Shape (n_edges,) positional steps
 
 
 ### `diffuse()`
 
-Applies random-walk feature diffusion on the graph.
+Applies random-walk feature diffusion on a pseudotime graph.
 
 **Parameters**:
-- `X` (torch.Tensor): Feature matrix (n_cells, n_features)
-- `edge_index` (torch.Tensor): Sparse edges (2, n_edges)
-- `alpha` (float): Blending weight ∈ (0, 1] (default: 0.6)
-- `n_steps` (int): Number of iterations (default: 1)
-- `add_self_loops` (bool): Add residual self-loops (default: True)
-- `edge_weight` (torch.Tensor | None): Optional per-edge weights for weighted aggregation (default: None)
-- `M` (torch.Tensor | None): Optional explicit feature-mixing matrix (n_features, n_features). Use for small feature spaces (e.g., PCA). Mutually exclusive with `U`.
-- `U` (torch.Tensor | None): Optional low-rank feature coupling (n_features, r). Use for large feature spaces (e.g., genes). Mutually exclusive with `M`.
-- `beta` (float): Coupling strength for low-rank U. Ignored if U is None. Default: 0.0.
+- `X` (torch.Tensor): Feature matrix of shape (n_cells, n_features)
+- `edge_index` (torch.Tensor): Sparse edge list of shape (2, n_edges),
+  with edges interpreted as src → dst (aggregation into dst)
+- `alpha` (float): Blend weight in [0, 1] (default: 0.6)
+- `n_steps` (int): Number of diffusion iterations (default: 1)
+- `edge_weight` (torch.Tensor | None): Optional non-negative per-edge weights
+  aligned with edge_index (default: None)
+- `add_self_loops` (bool): If True, include self-loops inside the aggregation
+  operator (default: False)
+- `self_loop_weight` (float): Weight assigned to self-loop edges when
+  add_self_loops=True (default: 1.0)
+- `M` (torch.Tensor | None): Optional explicit feature-mixing matrix of shape
+  (n_features, n_features) (mutually exclusive with U)
+- `U` (torch.Tensor | None): Optional low-rank feature coupling of shape
+  (n_features, r) (e.g., PCA loadings; mutually exclusive with M)
+- `beta` (float): Coupling strength for low-rank feature coupling
+  (default: 0.0)
 
 **Returns**:
-- `X_diffused` (torch.Tensor): Smoothed features, same shape as X
+- `X_smooth` (torch.Tensor): Diffused features with the same shape as X
 
 **Notes**:
-- Only one of `M` or `U` may be provided. If both are given, a `ValueError` is raised.
+- Aggregation is performed over incoming neighbors (src → dst).
+- Only one of `M` or `U` may be provided.
+- Edge weights and self-loop weights must be finite and non-negative.
 
 ## Example: Alpha Effect on Embeddings
 
-Grid showing diffusion strength (α ∈ {0.0, 0.2, 0.4, 0.6}). Top row colored by `clusterid`, bottom row by `pseudotime`.
+Actual scRNA-seq data with pseudotime and branch trajectories inferred using a cluster-based minimum spanning tree (cMST) approach (Lamian). Grid showing diffusion strength (α ∈ {0.0, 0.2, 0.4, 0.6}). Top row colored by clusterid, bottom row by pseudotime.
 
 ![Alpha diffusion grid](examples/alpha_grid.png)
 
